@@ -18,6 +18,9 @@
 #include <string.h>
 #define __STDC_CONSTANT_MACROS
 
+/*SDL audio buffer size, in samples. */
+#define SDL_AUDIO_BUFFER_SIZE 1024
+
 extern "C"
 {
 #include "libavcodec/avcodec.h"
@@ -40,13 +43,13 @@ void fill_audio(void *udata, Uint8 *stream, int len)
 
     //SDL 2.0
     SDL_memset(stream, 0, len);
-    //printf("fill_audio: %d \n",stream[10]);
+    
     if(audio_len==0)		/*  Only  play  if  we  have  data  left  */
         return;
     len=(len>audio_len?audio_len:len);	/*  Mix  as  much  data  as  possible  */
 
     SDL_MixAudio(stream,audio_pos,len,SDL_MIX_MAXVOLUME);
-    printf("audio_len : %d audio pos:%d :len : %d \n",audio_len ,audio_pos,len);
+    printf("audio_len : %d audio pos:%d :len : %d  \n",audio_len ,audio_pos,len);
     audio_pos += len;
     audio_len -= len;
 }
@@ -60,10 +63,11 @@ int main(int argc, char *argv[])
     AVFrame			*pFrame;
     int64_t 		in_channel_layout;
     struct SwrContext *au_convert_ctx;
-    uint8_t			*out_buffer;
-    SDL_AudioSpec wanted_spec;
+    uint8_t			*audio_buffer;
+    SDL_AudioSpec wanted_spec,spec;
     int index = 0;
     uint32_t len = 0;
+    int data_size=0;
 
     //if( argc>1)
     {
@@ -121,16 +125,25 @@ int main(int argc, char *argv[])
 
         AVCodec         *aCodec;
         aCodec = avcodec_find_decoder(aCodecCtxOrig->codec_id);
+		
+		
         if(!aCodec) {
             printf("Unsupported codec!\n");
             return -1;
         }
+
         // Copy context
         aCodecCtx = avcodec_alloc_context3(aCodec);
         if(avcodec_copy_context(aCodecCtx, aCodecCtxOrig) != 0) {
             printf( "Couldn't copy codec context\n");
             return -1; // Error copying codec context
         }
+		// MP3 decodes to S16P which we don't support, tell it to use S16 instead.
+       if (aCodecCtx->sample_fmt == AV_SAMPLE_FMT_S16P)
+	   {   
+           printf ("Found planar audio S16P \n");
+		   aCodecCtx->request_sample_fmt = AV_SAMPLE_FMT_S16;
+	   }
 
         // Open codec
         if(avcodec_open2(aCodecCtx, aCodec, NULL)){
@@ -154,43 +167,45 @@ int main(int argc, char *argv[])
         }
         printf("Init SDL :OK \n");
 
-        //Out Audio Param
-        int out_nb_samples=1024;
-        int out_sample_rate=44100;
-        uint64_t out_channel_layout=AV_CH_LAYOUT_STEREO;
-        int out_channels=av_get_channel_layout_nb_channels(out_channel_layout);
-        printf(" out_channels %d \n",out_channels);
+
 
         /* Set the audio format */
         //SDL_AudioSpec
-        wanted_spec.freq = out_sample_rate;
+        wanted_spec.freq =  aCodecCtx->sample_rate;
         wanted_spec.format = AUDIO_S16SYS;
-        wanted_spec.channels = out_channels;
+        wanted_spec.channels =aCodecCtx->channels;
         wanted_spec.silence = 0;
-        wanted_spec.samples = out_nb_samples;
+        wanted_spec.samples = SDL_AUDIO_BUFFER_SIZE ;
         wanted_spec.callback = fill_audio;
         wanted_spec.userdata = NULL;
 
         /* Open the audio device, forcing the desired format */
-        if ( SDL_OpenAudio(&wanted_spec, NULL) < 0 ) {
+        if ( SDL_OpenAudio(&wanted_spec,&spec) < 0 ) {
             printf("Couldn't open audio: %s\n", SDL_GetError());
             return(-1);
         }
         printf("Open audio:OK \n");
 
         //Setting up out_buffer
-        AVSampleFormat out_sample_fmt=AV_SAMPLE_FMT_S16;
-        int out_buffer_size=av_samples_get_buffer_size(NULL,out_channels ,out_nb_samples,out_sample_fmt, 1);
-        out_buffer=(uint8_t *)av_malloc(MAX_AUDIO_FRAME_SIZE*2);
+         audio_buffer=(uint8_t *)av_malloc(MAX_AUDIO_FRAME_SIZE*2);
+		
+		/*
+		AV_SAMPLE_FMT_S16P is planar signed 16 bit audio, i.e. 2 bytes for each sample which is same for AV_SAMPLE_FMT_S16.
+        The only difference is in AV_SAMPLE_FMT_S16 samples of each channel are interleaved i.e. if you have two channel 
+	    audio then the samples buffer will look like
+        c1 c1 c2 c2 c1 c1 c2 c2...
+        where c1 is a sample for channel1 and c2 is sample for channel2.
+        while for one frame of planar audio you will have something like
+		c1 c1 c1 c1 .... c2 c2 c2 c2 .. 
+		now how is it stored in AVFrame: for planar audio:
+        data[i] will contain the data of channel i (assuming channel 0 is first channel).
+        however if you have more channels then 8 then data for rest of the channels can be found in extended_data attribute of AVFrame.
+        for non-planar audio data[0] will contain the data for all channels in an interleaved manner.	
+	   */
 
-        //FIX:Some Codec's Context Information is missing
-        in_channel_layout=av_get_default_channel_layout(aCodecCtx->channels);
-        //Swr
-        au_convert_ctx = swr_alloc();
-        au_convert_ctx=swr_alloc_set_opts(au_convert_ctx,out_channel_layout, out_sample_fmt, out_sample_rate,
-                                          in_channel_layout,aCodecCtx->sample_fmt , aCodecCtx->sample_rate,0, NULL);
-        swr_init(au_convert_ctx);
-        
+
+        printf ("aCodecCtx->sample_fmt %d \n",aCodecCtx->sample_fmt);
+		
         while(av_read_frame(pFormatCtx, packet)>=0){
 
             //Check packet for audio
@@ -206,21 +221,25 @@ int main(int argc, char *argv[])
                 if (got_frame){
 
                     //printf("index:%5d\t pts:%lld\t packet size:%d\n",index,packet->pts,packet->size);
+                    data_size = av_samples_get_buffer_size(NULL,
+                                               aCodecCtx->channels,
+                                               pFrame->nb_samples,
+                                               AV_SAMPLE_FMT_S16,
+                                               1);
+											   
+											   
 
-                    int ret=swr_convert(au_convert_ctx,&out_buffer, MAX_AUDIO_FRAME_SIZE,(const uint8_t **)pFrame->data , pFrame->nb_samples);
+                       // assert(data_size <= buf_size);
+                        memcpy(audio_buffer, pFrame->data[0], data_size);
+                        printf ("data_size :%d nbsample:%d \n", data_size,pFrame->nb_samples);
 
-                    if (ret < 0)
-                    {
-                        printf("swr_convert error \n");
-                        return -1;
-                    }
                     if(wanted_spec.samples!=pFrame->nb_samples){
                         printf("FIX:FLAC,MP3,AAC Different number of samples");
                         SDL_CloseAudio();
-                        out_nb_samples=pFrame->nb_samples;
-                        out_buffer_size=av_samples_get_buffer_size(NULL,out_channels ,out_nb_samples,out_sample_fmt, 1);
-                        wanted_spec.samples=out_nb_samples;
-                        if (SDL_OpenAudio(&wanted_spec, NULL)<0){
+
+                         data_size=av_samples_get_buffer_size(NULL,aCodecCtx->channels ,pFrame->nb_samples,AV_SAMPLE_FMT_S16, 1);
+                        wanted_spec.samples=pFrame->nb_samples;
+                        if (SDL_OpenAudio(&wanted_spec, &spec)<0){
                             printf("can't open audio.\n");
                             return -1;
                         }
@@ -231,9 +250,9 @@ int main(int argc, char *argv[])
 
                 //Play
                 //Set audio buffer (PCM data)
-                audio_chunk = (Uint8 *) out_buffer;
+                audio_chunk = (Uint8 *) audio_buffer;
                 //Audio buffer length
-                audio_len =out_buffer_size;
+                audio_len = data_size ;
                 audio_pos = audio_chunk;
                 //Play
                 SDL_PauseAudio(0);
@@ -248,7 +267,7 @@ int main(int argc, char *argv[])
 
         //Clean up stuff
         swr_free(&au_convert_ctx);
-        av_free(out_buffer);
+        av_free(audio_buffer);
         av_frame_free(&pFrame);
 
         // Close the codec
