@@ -224,7 +224,7 @@ int main(int argc, char *argv[])
                     data_size = av_samples_get_buffer_size(NULL,
                                                aCodecCtx->channels,
                                                pFrame->nb_samples,
-                                               AV_SAMPLE_FMT_S16,
+                                               aCodecCtx->sample_fmt,
                                                1);
 											   
 											   
@@ -237,7 +237,7 @@ int main(int argc, char *argv[])
                         printf("FIX:FLAC,MP3,AAC Different number of samples");
                         SDL_CloseAudio();
 
-                         data_size=av_samples_get_buffer_size(NULL,aCodecCtx->channels ,pFrame->nb_samples,AV_SAMPLE_FMT_S16, 1);
+                         data_size=av_samples_get_buffer_size(NULL,aCodecCtx->channels ,pFrame->nb_samples,aCodecCtx->sample_fmt , 1);
                         wanted_spec.samples=pFrame->nb_samples;
                         if (SDL_OpenAudio(&wanted_spec, &spec)<0){
                             printf("can't open audio.\n");
